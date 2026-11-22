@@ -213,3 +213,190 @@ class TestProducerValidation:
         url = "wss://stream.binance.com:9443/ws/" + "/".join(streams)
         assert "btcusdt@kline_1m" in url
         assert "ethusdt@trade" in url
+
+
+# ─────────────────────────────────────────────
+# Input validation (Nhiệm vụ 4/5 – data quality)
+# ─────────────────────────────────────────────
+
+import asyncio
+
+import websockets
+
+from ingestion.kafka_utils import produce_with_retry
+from ingestion.kafka_config import WS_RECONNECT_INITIAL_DELAY
+
+
+def _kline_with(**overrides):
+    bad = {**SAMPLE_KLINE_EVENT}
+    bad["k"] = {**SAMPLE_KLINE_EVENT["k"], **overrides}
+    return bad
+
+
+class TestKlineValidation:
+    @pytest.mark.parametrize("overrides", [
+        {"c": "-1"},                       # negative price
+        {"o": "0"},                        # zero price
+        {"v": "nan"},                      # NaN volume
+        {"q": "inf"},                      # infinite quote volume
+        {"v": "-0.5"},                     # negative volume
+        {"h": "36900.00"},                 # high < low
+        {"c": "38000.00"},                 # close above high
+        {"t": 0},                          # invalid open_time
+    ])
+    def test_invalid_values_are_rejected(self, overrides):
+        assert parse_kline_event(_kline_with(**overrides)) is None
+
+    def test_invalid_event_time_is_rejected(self):
+        assert parse_kline_event({**SAMPLE_KLINE_EVENT, "E": None}) is None
+
+    def test_unclosed_candle_is_kept(self):
+        result = parse_kline_event(_kline_with(x=False))
+        assert result is not None and result["is_closed"] is False
+
+
+class TestTradeValidation:
+    def test_event_time_falls_back_to_trade_time(self):
+        raw = {k: v for k, v in SAMPLE_TRADE_EVENT.items() if k != "E"}
+        result = parse_trade_event(raw)
+        assert result is not None
+        assert result["event_time"] == result["trade_time"]
+
+    def test_trade_time_falls_back_to_event_time(self):
+        raw = {k: v for k, v in SAMPLE_TRADE_EVENT.items() if k != "T"}
+        result = parse_trade_event(raw)
+        assert result is not None
+        assert result["trade_time"] == result["event_time"]
+
+    def test_no_timestamp_is_rejected(self):
+        raw = {k: v for k, v in SAMPLE_TRADE_EVENT.items() if k not in ("E", "T")}
+        assert parse_trade_event(raw) is None
+
+    @pytest.mark.parametrize("field,value", [("p", "0"), ("p", "-5"), ("p", "nan"), ("q", "0"), ("q", "abc")])
+    def test_invalid_price_or_quantity_is_rejected(self, field, value):
+        assert parse_trade_event({**SAMPLE_TRADE_EVENT, field: value}) is None
+
+
+class TestBookTickerValidation:
+    def test_crossed_book_is_rejected(self):
+        assert parse_book_ticker_event({**SAMPLE_BOOK_TICKER, "b": "37060.00"}) is None
+
+    def test_negative_quantity_is_rejected(self):
+        assert parse_book_ticker_event({**SAMPLE_BOOK_TICKER, "B": "-1"}) is None
+
+    def test_equal_bid_ask_is_kept(self):
+        assert parse_book_ticker_event({**SAMPLE_BOOK_TICKER, "b": "37050.00"}) is not None
+
+
+class TestRESTParserValidation:
+    def test_in_progress_candle_is_not_closed(self):
+        now_ms = SAMPLE_REST_ROW[6] - 1_000      # 1s before the candle closes
+        result = parse_kline_row(SAMPLE_REST_ROW, "BTCUSDT", "1m", now_ms=now_ms)
+        assert result["is_closed"] is False
+
+    def test_finished_candle_is_closed(self):
+        now_ms = SAMPLE_REST_ROW[6] + 1
+        result = parse_kline_row(SAMPLE_REST_ROW, "BTCUSDT", "1m", now_ms=now_ms)
+        assert result["is_closed"] is True
+
+    def test_malformed_row_returns_none(self):
+        assert parse_kline_row(SAMPLE_REST_ROW[:5], "BTCUSDT", "1m") is None
+
+    def test_invalid_price_returns_none(self):
+        bad = list(SAMPLE_REST_ROW)
+        bad[4] = "-1"
+        assert parse_kline_row(bad, "BTCUSDT", "1m") is None
+
+
+# ─────────────────────────────────────────────
+# Dispatcher / Kafka producer robustness
+# ─────────────────────────────────────────────
+
+def _bare_ws_producer():
+    """Producer instance without connecting to Kafka."""
+    producer = BinanceWebSocketProducer.__new__(BinanceWebSocketProducer)
+    producer.symbols = ["BTCUSDT"]
+    producer.interval = "1m"
+    producer.producer = MagicMock()
+    producer._stop = False
+    producer._msg_count = 0
+    producer._invalid_count = 0
+    producer._dropped_count = 0
+    producer._error_count = 0
+    producer._connected = False
+    return producer
+
+
+class TestDispatcher:
+    def test_non_dict_payload_is_skipped(self):
+        p = _bare_ws_producer()
+        p._dispatch(["not", "a", "dict"])
+        p.producer.produce.assert_not_called()
+        assert p._error_count == 1
+
+    def test_book_ticker_routes_to_orderbook_topic(self):
+        p = _bare_ws_producer()
+        p._dispatch(SAMPLE_BOOK_TICKER)
+        assert p.producer.produce.call_args.kwargs["topic"] == TOPICS["raw_orderbook"]
+
+    def test_other_event_with_bid_ask_is_not_routed_to_orderbook(self):
+        p = _bare_ws_producer()
+        p._dispatch({"e": "depthUpdate", "s": "BTCUSDT", "b": [], "a": [], "u": 1})
+        p.producer.produce.assert_not_called()
+
+    def test_topics_and_keys_unchanged(self):
+        p = _bare_ws_producer()
+        p._dispatch(SAMPLE_KLINE_EVENT)
+        p._dispatch(SAMPLE_TRADE_EVENT)
+        calls = p.producer.produce.call_args_list
+        assert [c.kwargs["topic"] for c in calls] == [TOPICS["raw_ohlcv"], TOPICS["raw_ticks"]]
+        assert all(c.kwargs["key"] == b"BTCUSDT" for c in calls)
+        assert all("partition" not in c.kwargs for c in calls)
+
+    def test_invalid_message_is_counted_not_sent(self):
+        p = _bare_ws_producer()
+        p._dispatch({**SAMPLE_TRADE_EVENT, "p": "-1"})
+        p.producer.produce.assert_not_called()
+        assert p._invalid_count == 1
+
+
+class TestProduceWithRetry:
+    def test_retries_once_after_buffer_error(self):
+        producer = MagicMock()
+        producer.produce.side_effect = [BufferError("full"), None]
+        assert produce_with_retry(producer, "raw-ohlcv", b"{}", b"BTCUSDT") is True
+        assert producer.produce.call_count == 2
+        producer.flush.assert_called_once()
+
+    def test_returns_false_when_retry_fails(self):
+        producer = MagicMock()
+        producer.produce.side_effect = BufferError("full")
+        assert produce_with_retry(producer, "raw-ohlcv", b"{}", b"BTCUSDT") is False
+
+
+class TestReconnectBackoff:
+    def _run(self, connects: bool, sessions: int = 4):
+        p = _bare_ws_producer()
+        delays = []
+
+        async def fake_listen(url):
+            if connects:
+                p._connected = True
+            if len(delays) + 1 >= sessions:
+                p._stop = True
+            raise websockets.ConnectionClosedError(None, None)
+
+        async def fake_sleep(seconds):
+            delays.append(seconds)
+
+        p._listen = fake_listen
+        with patch("ingestion.binance_ws_producer.asyncio.sleep", fake_sleep):
+            asyncio.run(p._run_with_backoff())
+        return delays
+
+    def test_backoff_resets_after_successful_session(self):
+        assert set(self._run(connects=True)) == {WS_RECONNECT_INITIAL_DELAY}
+
+    def test_backoff_grows_while_connection_keeps_failing(self):
+        delays = self._run(connects=False)
+        assert delays == sorted(delays) and delays[-1] > delays[0]
