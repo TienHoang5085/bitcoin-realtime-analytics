@@ -92,7 +92,7 @@ def check_data_quality():
         topic_names = list(topics.topics.keys())
         logger.info("Kafka topics available: %s", topic_names)
 
-        required = ["raw-ohlcv", "raw-crypto-ticks", "alert-events"]
+        required = ["raw-ohlcv", "raw-crypto-ticks", "raw-orderbook", "alert-events"]
         missing = [t for t in required if t not in topic_names]
         if missing:
             logger.warning("Missing Kafka topics: %s", missing)
