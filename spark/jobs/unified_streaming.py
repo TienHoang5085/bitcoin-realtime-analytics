@@ -59,9 +59,9 @@ INDICATOR_HISTORY_ROWS = 100
 # Business key of one candle
 CANDLE_KEY = ["symbol", "interval", "open_time"]
 
-# Business key of one Gold row, and Gold windows kept as VWAP / volume-ratio context
+# Business key of one Gold row, and preceding Gold windows loaded as indicator context
 GOLD_KEY = ["symbol", "timeframe", "window_start"]
-GOLD_HISTORY_ROWS = 20
+GOLD_HISTORY_ROWS = 100
 
 # Fields read from MongoDB alert_rules. "value" is a string so that numeric and
 # text conditions (e.g. candle_pattern) share one column.
@@ -188,6 +188,89 @@ def transform_bronze(raw_df: DataFrame) -> DataFrame:
 # SILVER TRANSFORM
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _add_price_indicators(df: DataFrame, series_win) -> DataFrame:
+    """MA, Bollinger, ATR, price change, RSI and MACD over an ordered candle series.
+
+    series_win partitions one series and orders it by candle start time, so one
+    period is one candle of that series: 1 minute in Silver, the timeframe in
+    Gold (ma7 on 1h = 7 hours). Needs the columns high, low, close.
+    An indicator stays null until its window holds enough candles.
+    """
+    # Moving Averages
+    df = (
+        df
+        .withColumn("ma7",  F.avg("close").over(series_win.rowsBetween(-6, 0)))
+        .withColumn("ma25", F.avg("close").over(series_win.rowsBetween(-24, 0)))
+        .withColumn("ma99", F.avg("close").over(series_win.rowsBetween(-98, 0)))
+    )
+
+    # Bollinger Bands (20-period)
+    bb_win = series_win.rowsBetween(-19, 0)
+    df = (
+        df
+        .withColumn("bb_middle", F.avg("close").over(bb_win))
+        .withColumn("_std20", F.stddev_samp("close").over(bb_win))
+        .withColumn("bb_upper", F.col("bb_middle") + 2 * F.col("_std20"))
+        .withColumn("bb_lower", F.col("bb_middle") - 2 * F.col("_std20"))
+        .drop("_std20")
+    )
+
+    # Prev close, ATR
+    df = df.withColumn("prev_close", F.lag("close", 1).over(series_win))
+    df = df.withColumn("_tr", udf_calculate_atr(F.col("high"), F.col("low"), F.col("prev_close")))
+    df = df.withColumn("atr_14", F.avg("_tr").over(series_win.rowsBetween(-13, 0))).drop("_tr")
+
+    # Price change %
+    df = df.withColumn(
+        "price_change_pct",
+        F.when(
+            F.col("prev_close").isNotNull() & (F.col("prev_close") != 0),
+            (F.col("close") - F.col("prev_close")) / F.col("prev_close") * 100,
+        ).otherwise(None)
+    )
+
+    # RSI-14 (SMA approximation)
+    delta_col = F.col("close") - F.col("prev_close")
+    df = df.withColumn("_delta", delta_col)
+    df = df.withColumn("_gain", F.when(F.col("_delta") > 0, F.col("_delta")).otherwise(0.0))
+    df = df.withColumn("_loss", F.when(F.col("_delta") < 0, -F.col("_delta")).otherwise(0.0))
+    rsi_win = series_win.rowsBetween(-13, 0)
+    df = df.withColumn("avg_gain_14", F.avg("_gain").over(rsi_win))
+    df = df.withColumn("avg_loss_14", F.avg("_loss").over(rsi_win))
+    df = df.withColumn(
+        "rsi_14",
+        F.when(F.col("avg_loss_14").isNull() | F.col("avg_gain_14").isNull(), None)
+        .when(F.col("avg_loss_14") == 0, F.lit(100.0))
+        .otherwise(100 - (100 / (1 + (F.col("avg_gain_14") / F.col("avg_loss_14")))))
+    ).drop("_delta", "_gain", "_loss", "avg_gain_14", "avg_loss_14")
+
+    # MACD (SMA approximation)
+    df = df.withColumn("sma12", F.avg("close").over(series_win.rowsBetween(-11, 0)))
+    df = df.withColumn("sma26", F.avg("close").over(series_win.rowsBetween(-25, 0)))
+    df = df.withColumn("macd", F.col("sma12") - F.col("sma26"))
+    df = df.withColumn("macd_signal", F.avg("macd").over(series_win.rowsBetween(-8, 0)))
+    df = df.withColumn("macd_hist", F.col("macd") - F.col("macd_signal")).drop("sma12", "sma26")
+
+    # Warm-up: an indicator stays null until its window holds enough values
+    def _require(column: str, counted: str, minimum: int):
+        seen = F.count(counted).over(series_win.rowsBetween(-(minimum - 1), 0))
+        return F.when(seen >= minimum, F.col(column))
+
+    # Order matters: macd_signal / macd_hist are gated before macd itself is nulled
+    warmup = [
+        ("ma7", "close", 7), ("ma25", "close", 25), ("ma99", "close", 99),
+        ("bb_middle", "close", 20), ("bb_upper", "close", 20), ("bb_lower", "close", 20),
+        ("atr_14", "close", 14),
+        ("rsi_14", "prev_close", 14),       # 14 price changes = 15 candles
+        ("macd_signal", "close", 34),       # 26 candles for MACD + 8 more for SMA9
+        ("macd_hist", "close", 34),
+        ("macd", "close", 26),
+    ]
+    for column, counted, minimum in warmup:
+        df = df.withColumn(column, _require(column, counted, minimum))
+    return df
+
+
 def transform_silver(bronze_df: DataFrame) -> DataFrame:
     """Clean + dedup + technical indicators (MA, RSI, MACD, BB, ATR)."""
     # Column pruning
@@ -227,61 +310,7 @@ def transform_silver(bronze_df: DataFrame) -> DataFrame:
 
     # ── Technical Indicators (Window-based) ───────────────────────────────
     sym_win = Window.partitionBy("symbol", "interval").orderBy("open_time")
-
-    # Moving Averages
-    df = (
-        df
-        .withColumn("ma7",  F.avg("close").over(sym_win.rowsBetween(-6, 0)))
-        .withColumn("ma25", F.avg("close").over(sym_win.rowsBetween(-24, 0)))
-        .withColumn("ma99", F.avg("close").over(sym_win.rowsBetween(-98, 0)))
-    )
-
-    # Bollinger Bands (20-period)
-    bb_win = sym_win.rowsBetween(-19, 0)
-    df = (
-        df
-        .withColumn("bb_middle", F.avg("close").over(bb_win))
-        .withColumn("_std20", F.stddev_samp("close").over(bb_win))
-        .withColumn("bb_upper", F.col("bb_middle") + 2 * F.col("_std20"))
-        .withColumn("bb_lower", F.col("bb_middle") - 2 * F.col("_std20"))
-        .drop("_std20")
-    )
-
-    # Prev close, ATR
-    df = df.withColumn("prev_close", F.lag("close", 1).over(sym_win))
-    df = df.withColumn("_tr", udf_calculate_atr(F.col("high"), F.col("low"), F.col("prev_close")))
-    df = df.withColumn("atr_14", F.avg("_tr").over(sym_win.rowsBetween(-13, 0))).drop("_tr")
-
-    # Price change %
-    df = df.withColumn(
-        "price_change_pct",
-        F.when(
-            F.col("prev_close").isNotNull() & (F.col("prev_close") != 0),
-            (F.col("close") - F.col("prev_close")) / F.col("prev_close") * 100,
-        ).otherwise(None)
-    )
-
-    # RSI-14 (SMA approximation)
-    delta_col = F.col("close") - F.col("prev_close")
-    df = df.withColumn("_delta", delta_col)
-    df = df.withColumn("_gain", F.when(F.col("_delta") > 0, F.col("_delta")).otherwise(0.0))
-    df = df.withColumn("_loss", F.when(F.col("_delta") < 0, -F.col("_delta")).otherwise(0.0))
-    rsi_win = sym_win.rowsBetween(-13, 0)
-    df = df.withColumn("avg_gain_14", F.avg("_gain").over(rsi_win))
-    df = df.withColumn("avg_loss_14", F.avg("_loss").over(rsi_win))
-    df = df.withColumn(
-        "rsi_14",
-        F.when(F.col("avg_loss_14").isNull() | F.col("avg_gain_14").isNull(), None)
-        .when(F.col("avg_loss_14") == 0, F.lit(100.0))
-        .otherwise(100 - (100 / (1 + (F.col("avg_gain_14") / F.col("avg_loss_14")))))
-    ).drop("_delta", "_gain", "_loss", "avg_gain_14", "avg_loss_14")
-
-    # MACD (SMA approximation)
-    df = df.withColumn("sma12", F.avg("close").over(sym_win.rowsBetween(-11, 0)))
-    df = df.withColumn("sma26", F.avg("close").over(sym_win.rowsBetween(-25, 0)))
-    df = df.withColumn("macd", F.col("sma12") - F.col("sma26"))
-    df = df.withColumn("macd_signal", F.avg("macd").over(sym_win.rowsBetween(-8, 0)))
-    df = df.withColumn("macd_hist", F.col("macd") - F.col("macd_signal")).drop("sma12", "sma26")
+    df = _add_price_indicators(df, sym_win)
 
     # Volume ratio
     vol_win = sym_win.rowsBetween(-19, 0)
@@ -294,20 +323,12 @@ def transform_silver(bronze_df: DataFrame) -> DataFrame:
         ).otherwise(None)
     )
 
-    # Warm-up: an indicator stays null until its window holds enough values
+    # Warm-up for the volume indicators (price indicators are gated in their function)
     def _require(column: str, counted: str, minimum: int):
         seen = F.count(counted).over(sym_win.rowsBetween(-(minimum - 1), 0))
         return F.when(seen >= minimum, F.col(column))
 
-    # Order matters: macd_signal / macd_hist are gated before macd itself is nulled
     warmup = [
-        ("ma7", "close", 7), ("ma25", "close", 25), ("ma99", "close", 99),
-        ("bb_middle", "close", 20), ("bb_upper", "close", 20), ("bb_lower", "close", 20),
-        ("atr_14", "close", 14),
-        ("rsi_14", "prev_close", 14),       # 14 price changes = 15 candles
-        ("macd_signal", "close", 34),       # 26 candles for MACD + 8 more for SMA9
-        ("macd_hist", "close", 34),
-        ("macd", "close", 26),
         ("avg_volume_20", "volume", 20), ("volume_ratio", "volume", 20),
     ]
     for column, counted, minimum in warmup:
@@ -426,10 +447,6 @@ def transform_gold(silver_df: DataFrame, spark: SparkSession) -> DataFrame:
     if candles is None:
         return None
 
-    def _last_known(column: str):
-        """Value of the latest candle (by open_time) where column is not null."""
-        return F.max_by(column, F.when(F.col(column).isNotNull(), F.col("open_time"))).alias(column)
-
     all_frames = []
     for name, secs in RESAMPLE_INTERVALS.items():
         dur = _seconds_to_duration(secs)
@@ -446,15 +463,6 @@ def transform_gold(silver_df: DataFrame, spark: SparkSession) -> DataFrame:
                 F.sum("volume").alias("volume"),
                 F.sum("quote_volume").alias("quote_volume"),
                 F.sum("trade_count").alias("trade_count"),
-                _last_known("ma7"),
-                _last_known("ma25"),
-                _last_known("rsi_14"),
-                _last_known("macd"),
-                _last_known("macd_signal"),
-                _last_known("bb_upper"),
-                _last_known("bb_lower"),
-                _last_known("atr_14"),
-                _last_known("candle_pattern"),
             )
             .join(touched, ["symbol", "time_window"], "left_semi")
             .select(
@@ -463,8 +471,7 @@ def transform_gold(silver_df: DataFrame, spark: SparkSession) -> DataFrame:
                 F.col("time_window.start").alias("window_start"),
                 F.col("time_window.end").alias("window_end"),
                 "open", "high", "low", "close", "volume", "quote_volume",
-                "trade_count", "ma7", "ma25", "rsi_14", "macd",
-                "macd_signal", "bb_upper", "bb_lower", "atr_14", "candle_pattern",
+                "trade_count",
             )
         )
         all_frames.append(agg)
@@ -474,11 +481,19 @@ def transform_gold(silver_df: DataFrame, spark: SparkSession) -> DataFrame:
 
     gold_df = reduce(DataFrame.unionByName, all_frames)
 
-    # Load history for Gold layer indicators (VWAP, Volume Ratio)
+    # Preceding Gold windows give indicators, VWAP and volume ratio their context
     combined_gold, has_history = _load_gold_history(spark, gold_df)
 
-    # VWAP
     sym_tf_win = Window.partitionBy("symbol", "timeframe").orderBy("window_start")
+
+    # Price indicators on this timeframe's candles (ma7 on 1h = 7 hours)
+    combined_gold = _add_price_indicators(combined_gold, sym_tf_win)
+    combined_gold = combined_gold.withColumn(
+        "candle_pattern",
+        udf_classify_candle(F.col("open"), F.col("high"), F.col("low"), F.col("close"))
+    ).drop("ma99", "bb_middle", "prev_close", "price_change_pct", "macd_hist")  # not Gold columns
+
+    # VWAP
     vwap_win = sym_tf_win.rowsBetween(-20, 0)
     combined_gold = combined_gold.withColumn("_tp", (F.col("high") + F.col("low") + F.col("close")) / 3)
     combined_gold = combined_gold.withColumn("_tp_vol", F.col("_tp") * F.col("volume"))
