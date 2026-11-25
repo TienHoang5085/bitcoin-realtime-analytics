@@ -98,7 +98,13 @@ services:
       minio:
         condition: service_started
     entrypoint: >
-      /bin/sh -c " sleep 5; /usr/bin/mc config host add myminio http://minio:9000 admin password; /usr/bin/mc mb myminio/crypto-lake || true; /usr/bin/mc mb myminio/checkpoints || true; exit 0; "
+      /bin/sh -c " 
+      sleep 5; 
+      /usr/bin/mc alias set myminio http://minio:9000 admin password &&
+      /usr/bin/mc mb --ignore-existing myminio/crypto-lake &&
+      /usr/bin/mc mb --ignore-existing myminio/checkpoints &&
+      /usr/bin/mc ls myminio
+      "
     networks:
       - crypto-net
 
@@ -117,8 +123,9 @@ services:
     healthcheck:
       test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')" ]
       interval: 10s
-      timeout: 5s
+      timeout: 15s
       retries: 5
+      start_period: 30s
     deploy:
       resources:
         limits:

@@ -32,7 +32,7 @@ from typing import List, Optional
 import aiohttp
 # aiohttp trong Python là một thư viện dùng để làm việc với HTTP theo kiểu bất đồng bộ (asynchronous)
 # Tức là bạn có thể gửi nhiều request cùng lúc mà không phải chờ từng cái chạy xong.
-from confluent_kafka import Producer, KafkaException
+from confluent_kafka import Producer
 
 # Import configuration + helpers from package-local module
 from ingestion.kafka_config import (
@@ -46,6 +46,8 @@ from ingestion.kafka_config import (
     get_partition_for_symbol,
     SUPPORTED_SYMBOLS,
 )
+from ingestion.kafka_utils import produce_with_retry
+from ingestion.validation import is_valid_timestamp_ms, validate_ohlcv
 
 # ─────────────────────────────────────────────
 # Logging
@@ -77,37 +79,64 @@ INTERVAL_MS: dict = {
 # ─────────────────────────────────────────────
 # OHLCV Row → dict
 # ─────────────────────────────────────────────
-def parse_kline_row(row: list, symbol: str, interval: str) -> dict:
+def parse_kline_row(
+    row: list,
+    symbol: str,
+    interval: str,
+    now_ms: Optional[int] = None,
+) -> Optional[dict]:
     """
     Parse a single Binance klines API row into a standardised dict.
     Binance kline format:
       [open_time, open, high, low, close, volume, close_time,
        quote_volume, trade_count, taker_buy_base_vol, taker_buy_quote_vol, ignore]
-    """
-    open_time_ms  = int(row[0])
-    close_time_ms = int(row[6])
-    open_dt       = datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc)
 
-    return {
-        "symbol":              symbol,
-        "event_time":          open_dt.isoformat(),
-        "ingest_time":         datetime.now(tz=timezone.utc).isoformat(),
-        "open_time":           open_dt.isoformat(),
-        "close_time":          datetime.fromtimestamp(close_time_ms / 1000, tz=timezone.utc).isoformat(),
-        "interval":            interval,
-        "open":                float(row[1]),
-        "high":                float(row[2]),
-        "low":                 float(row[3]),
-        "close":               float(row[4]),
-        "volume":              float(row[5]),
-        "quote_volume":        float(row[7]),
-        "trade_count":         int(row[8]),
-        "taker_buy_base_vol":  float(row[9]),
-        "taker_buy_quote_vol": float(row[10]),
-        "is_closed":           True,           # REST data is always closed candles
-        "source":              "rest",
-        "partition_date":      open_dt.strftime("%Y-%m-%d"),
-    }
+    Return `None` when the row is malformed or its values are invalid.
+
+    `is_closed` is True only when the candle's close_time is in the past:
+    the klines endpoint also returns the candle that is still forming, which
+    must not be flagged as closed (it would clash with the real closing
+    candle sent later by the WebSocket stream).
+    """
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+
+    try:
+        open_time_ms  = int(row[0])
+        close_time_ms = int(row[6])
+        if not (is_valid_timestamp_ms(open_time_ms) and is_valid_timestamp_ms(close_time_ms)):
+            raise ValueError(f"invalid open_time/close_time {row[0]!r}/{row[6]!r}")
+        open_dt = datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc)
+
+        record = {
+            "symbol":              symbol,
+            "event_time":          open_dt.isoformat(),
+            "ingest_time":         datetime.now(tz=timezone.utc).isoformat(),
+            "open_time":           open_dt.isoformat(),
+            "close_time":          datetime.fromtimestamp(close_time_ms / 1000, tz=timezone.utc).isoformat(),
+            "interval":            interval,
+            "open":                float(row[1]),
+            "high":                float(row[2]),
+            "low":                 float(row[3]),
+            "close":               float(row[4]),
+            "volume":              float(row[5]),
+            "quote_volume":        float(row[7]),
+            "trade_count":         int(row[8]),
+            "taker_buy_base_vol":  float(row[9]),
+            "taker_buy_quote_vol": float(row[10]),
+            "is_closed":           close_time_ms < now_ms,
+            "source":              "rest",
+            "partition_date":      open_dt.strftime("%Y-%m-%d"),
+        }
+    except (IndexError, TypeError, ValueError, OverflowError, OSError) as exc:
+        logger.warning("Failed to parse kline row for %s: %s | row=%s", symbol, exc, row)
+        return None
+
+    reason = validate_ohlcv(record)
+    if reason:
+        logger.warning("Invalid kline row for %s (%s) | row=%s", symbol, reason, row)
+        return None
+    return record
 
 
 # ─────────────────────────────────────────────
@@ -154,7 +183,7 @@ class BinanceRESTClient:
                         raise RuntimeError("Binance IP ban (HTTP 418)")
                     resp.raise_for_status()
                     return await resp.json()
-            except aiohttp.ClientError as exc:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 backoff = 2 ** attempt
                 logger.warning("HTTP error on attempt %d: %s – retry in %ds", attempt + 1, exc, backoff)
                 await asyncio.sleep(backoff)
@@ -192,6 +221,8 @@ class BinanceRESTProducer:
         self.interval_ms= INTERVAL_MS.get(interval, 60_000)
         self.producer   = Producer(PRODUCER_CONFIG)
         self._total_produced = 0
+        self._invalid_count  = 0   # rows rejected by parse/validation
+        self._dropped_count  = 0   # rows that could not be queued in Kafka
 
         invalid = [s for s in self.symbols if s not in SUPPORTED_SYMBOLS]
         if invalid:
@@ -219,31 +250,33 @@ class BinanceRESTProducer:
                 logger.info("No more data for %s at cursor %d", symbol, cursor_ms)
                 break
 
+            now_ms = int(time.time() * 1000)
             for row in rows:
-                parsed      = parse_kline_row(row, symbol, self.interval)
+                parsed = parse_kline_row(row, symbol, self.interval, now_ms=now_ms)
+                if parsed is None:
+                    self._invalid_count += 1
+                    continue
                 value_bytes = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
                 key_bytes   = symbol.encode("utf-8")
 
-                try:
-                    self.producer.produce(
-                        topic=TOPICS["raw_ohlcv"],
-                        value=value_bytes,
-                        key=key_bytes,
-                        # partition=partition,
-                        callback=_delivery_report,
-                    )
+                # partition=partition is intentionally NOT passed (unchanged behaviour).
+                if produce_with_retry(self.producer, TOPICS["raw_ohlcv"],
+                                      value_bytes, key_bytes, _delivery_report):
                     symbol_count += 1
                     self._total_produced += 1
-                except (KafkaException, BufferError) as exc:
-                    logger.warning("Produce error: %s – flushing buffer", exc)
-                    self.producer.flush(timeout=10)
+                else:
+                    self._dropped_count += 1
 
             # Poll to trigger callbacks
             self.producer.poll(0)
 
-            # Advance cursor past the last row's open_time
-            last_open_ms = int(rows[-1][0])
-            cursor_ms = last_open_ms + self.interval_ms
+            # Advance cursor past the last row's open_time. If that row is
+            # malformed, jump past this batch window so paging cannot stall.
+            try:
+                cursor_ms = int(rows[-1][0]) + self.interval_ms
+            except (IndexError, TypeError, ValueError):
+                logger.warning("Malformed last row for %s; skipping to end of batch window.", symbol)
+                cursor_ms = batch_end_ms + 1
 
             # Respect REST rate limit
             await asyncio.sleep(REST_REQUEST_DELAY_MS / 1000)
@@ -257,12 +290,24 @@ class BinanceRESTProducer:
         async with aiohttp.ClientSession(connector=connector) as session:
             client = BinanceRESTClient(session)
             tasks  = [self._fetch_and_produce_symbol(client, s) for s in self.symbols]
-            # Run concurrently per symbol, sequential per symbol internally
-            await asyncio.gather(*tasks, return_exceptions=False)
+            # Run concurrently per symbol, sequential per symbol internally.
+            # return_exceptions=True: one failing symbol no longer cancels the others.
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
         logger.info("Flushing Kafka buffer...")
         self.producer.flush(timeout=60)
-        logger.info("REST Producer done. Total produced: %d", self._total_produced)
+        logger.info(
+            "REST Producer done. Total produced: %d | invalid rows skipped: %d | dropped: %d",
+            self._total_produced, self._invalid_count, self._dropped_count,
+        )
+
+        failed = {s: r for s, r in zip(self.symbols, results) if isinstance(r, BaseException)}
+        for symbol, exc in failed.items():
+            logger.error("Backfill failed for %s: %s", symbol, exc)
+        if failed:
+            # Still signal failure to callers (e.g. the scheduler must not
+            # write its success marker), after the other symbols completed.
+            raise RuntimeError(f"REST backfill failed for symbols: {sorted(failed)}")
 
 
 # ─────────────────────────────────────────────
