@@ -63,6 +63,14 @@ CANDLE_KEY = ["symbol", "interval", "open_time"]
 GOLD_KEY = ["symbol", "timeframe", "window_start"]
 GOLD_HISTORY_ROWS = 20
 
+# Fields read from MongoDB alert_rules. "value" is a string so that numeric and
+# text conditions (e.g. candle_pattern) share one column.
+ALERT_RULE_SCHEMA = (
+    "rule_id STRING, user_id STRING, symbol STRING, timeframe STRING, action STRING, "
+    "is_active BOOLEAN, cooldown_seconds INT, last_triggered_at TIMESTAMP, "
+    "conditions ARRAY<STRUCT<field: STRING, operator: STRING, value: STRING>>, logic STRING"
+)
+
 # ── Pipeline Startup Timestamp ────────────────────────────────────────────
 # Set once in main(). Alerts are only evaluated for data with
 # window_start >= this value so that backfilled (historical) data does NOT
@@ -143,12 +151,20 @@ def transform_bronze(raw_df: DataFrame) -> DataFrame:
         .select(
             F.col("key").cast(StringType()).alias("_kafka_key"),
             F.col("timestamp").alias("_kafka_ts"),
+            # Lineage: (topic, partition, offset) identifies exactly one Kafka message
+            F.col("topic").alias("_kafka_topic"),
+            F.col("partition").alias("_kafka_partition"),
+            F.col("offset").alias("_kafka_offset"),
             F.from_json(
                 F.col("value").cast(StringType()),
                 BRONZE_OHLCV_SCHEMA
             ).alias("data")
         )
-        .select("_kafka_key", "_kafka_ts", "data.*")
+        .select(
+            "_kafka_key", "_kafka_ts",
+            "_kafka_topic", "_kafka_partition", "_kafka_offset",
+            "data.*",
+        )
     )
 
     # Validate critical fields
@@ -547,12 +563,18 @@ def _evaluate_single(row_data: dict, condition: dict) -> bool:
     return False
 
 
-def evaluate_alerts(gold_df: DataFrame, spark: SparkSession) -> DataFrame:
-    """Load alert rules from MongoDB, evaluate against Gold data, return triggered alerts."""
+def evaluate_alerts(gold_df: DataFrame, spark: SparkSession):
+    """Load alert rules from MongoDB, evaluate against Gold data, return triggered alerts.
+
+    Returns None when there is no active rule to evaluate.
+    """
     try:
         rules_df = (
             spark.read
             .format("mongodb")
+            # Explicit schema: an empty collection, or rules that never triggered
+            # (no last_triggered_at field), must not break column resolution
+            .schema(ALERT_RULE_SCHEMA)
             .option("spark.mongodb.read.connection.uri", MONGO_URI)
             .option("spark.mongodb.read.database", MONGO_DB)
             .option("spark.mongodb.read.collection", "alert_rules")
@@ -566,10 +588,10 @@ def evaluate_alerts(gold_df: DataFrame, spark: SparkSession) -> DataFrame:
         )
     except Exception as exc:
         logger.warning("Could not load alert rules from MongoDB: %s", exc)
-        return spark.createDataFrame([], "alert_id STRING")
+        return None
 
     if rules_df.isEmpty():
-        return spark.createDataFrame([], "alert_id STRING")
+        return None
 
     # ── Load previous Gold row for crosses_above / crosses_below ──────────
     try:
@@ -756,6 +778,27 @@ def _ensure_gold_index() -> None:
         logger.warning("Could not create gold_ohlcv index: %s", exc)
 
 
+def _append_bronze(spark: SparkSession, bronze_df: DataFrame, batch_id: int) -> None:
+    """Append to Bronze at most once per (streaming query, batch).
+
+    Delta skips a write whose txnVersion it has already committed for txnAppId,
+    so a replayed batch is not appended again. The query id is stored in the
+    checkpoint: it survives restarts and changes with a new checkpoint, whose
+    batch ids start from 0 again.
+    """
+    writer = (
+        bronze_df.write.format("delta").mode("append")
+        .option("mergeSchema", "true")
+        .partitionBy("symbol", "partition_date")
+    )
+    query_id = spark.sparkContext.getLocalProperty("sql.streaming.queryId")
+    if query_id:
+        writer = writer.option("txnAppId", f"bronze-{query_id}").option("txnVersion", batch_id)
+    else:
+        logger.warning("Batch %d: no streaming query id, Bronze append is not idempotent.", batch_id)
+    writer.save(delta_path("bronze", "ohlcv"))
+
+
 def process_batch(batch_df: DataFrame, batch_id: int):
     """Called for each micro-batch — runs full Medallion pipeline."""
     try:
@@ -768,10 +811,7 @@ def process_batch(batch_df: DataFrame, batch_id: int):
         # ── Bronze ────────────────────────────────────────────────────────────
         bronze_df = transform_bronze(batch_df)
         bronze_df.cache()
-        bronze_df.write.format("delta").mode("append") \
-            .option("mergeSchema", "true") \
-            .partitionBy("symbol", "partition_date") \
-            .save(delta_path("bronze", "ohlcv"))
+        _append_bronze(spark, bronze_df, batch_id)
         logger.info("Batch %d: Bronze written.", batch_id)
 
         # ── Silver (Fix #1: load history for accurate indicators) ─────────
@@ -822,11 +862,12 @@ def process_batch(batch_df: DataFrame, batch_id: int):
                     )
                 else:
                     alert_df = evaluate_alerts(realtime_gold, spark)
-                    if alert_df is not None and "alert_id" in alert_df.columns:
+                    if alert_df is not None:
                         alert_df.cache()
-                        if not alert_df.isEmpty():
-                            alert_count = alert_df.count()
-                            logger.info("Batch %d: %d alerts triggered.", batch_id, alert_count)
+
+                    if alert_df is not None and not alert_df.isEmpty():
+                        alert_count = alert_df.count()
+                        logger.info("Batch %d: %d alerts triggered.", batch_id, alert_count)
 
                         # Collect rule_ids for cooldown update BEFORE writing
                         triggered_rules = alert_df.select("rule_id").distinct().collect()
