@@ -56,6 +56,13 @@ RESAMPLE_INTERVALS = {
 # Number of historical rows to load for accurate indicator calculation
 INDICATOR_HISTORY_ROWS = 100
 
+# Business key of one candle
+CANDLE_KEY = ["symbol", "interval", "open_time"]
+
+# Business key of one Gold row, and Gold windows kept as VWAP / volume-ratio context
+GOLD_KEY = ["symbol", "timeframe", "window_start"]
+GOLD_HISTORY_ROWS = 20
+
 # ── Pipeline Startup Timestamp ────────────────────────────────────────────
 # Set once in main(). Alerts are only evaluated for data with
 # window_start >= this value so that backfilled (historical) data does NOT
@@ -63,36 +70,63 @@ INDICATOR_HISTORY_ROWS = 100
 PIPELINE_START_TIME: datetime | None = None
 
 
+def _latest_closed_candles(df: DataFrame) -> DataFrame:
+    """Keep closed candles only, one row per candle (latest ingest_time wins)."""
+    latest_first = Window.partitionBy(*CANDLE_KEY).orderBy(F.col("ingest_time").desc_nulls_last())
+    return (
+        df.filter(F.col("is_closed") == True)  # noqa: E712
+        .withColumn("_rn", F.row_number().over(latest_first))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+    )
+
+
 def _load_history(spark: SparkSession, new_df: DataFrame) -> DataFrame:
     """Load recent historical data from Delta Bronze and union with new batch.
+
+    Only closed, deduplicated candles are used. For each (symbol, interval) the
+    context is the INDICATOR_HISTORY_ROWS candles preceding the batch, plus any
+    stored candles inside the batch's time range that are not part of the batch.
+    Candles newer than the batch are never used.
 
     Returns (combined_df, has_history). Caller should filter '_is_new' == True
     after computing indicators to only write genuinely new rows.
     """
+    new_df = _latest_closed_candles(new_df)
+
     path = delta_path("bronze", "ohlcv")
     try:
         hist_df = spark.read.format("delta").load(path)
     except Exception:
         return new_df.withColumn("_is_new", F.lit(True)), False
 
-    pairs = new_df.select("symbol", "interval").distinct().collect()
-    if not pairs:
+    bounds = (
+        new_df.groupBy("symbol", "interval")
+        .agg(F.min("open_time").alias("first"), F.max("open_time").alias("last"))
+        .collect()
+    )
+    if not bounds:
         return new_df.withColumn("_is_new", F.lit(True)), False
 
     from functools import reduce as _reduce
     frames = []
-    for row in pairs:
-        sym, intv = row["symbol"], row["interval"]
-        subset = (
-            hist_df
-            .filter((F.col("symbol") == sym) & (F.col("interval") == intv))
+    for row in bounds:
+        closed = _latest_closed_candles(
+            hist_df.filter(
+                (F.col("symbol") == row["symbol"])
+                & (F.col("interval") == row["interval"])
+                & (F.col("open_time") <= F.lit(row["last"]))
+            )
+        )
+        frames.append(
+            closed.filter(F.col("open_time") < F.lit(row["first"]))
             .orderBy(F.col("open_time").desc())
             .limit(INDICATOR_HISTORY_ROWS)
         )
-        frames.append(subset)
+        frames.append(closed.filter(F.col("open_time") >= F.lit(row["first"])))
 
     history = _reduce(DataFrame.unionByName, frames)
-    history_clean = history.join(new_df, ["symbol", "interval", "open_time"], "left_anti")
+    history_clean = history.join(new_df, CANDLE_KEY, "left_anti")
     new_tagged = new_df.withColumn("_is_new", F.lit(True))
     hist_tagged = history_clean.withColumn("_is_new", F.lit(False))
     combined = new_tagged.unionByName(hist_tagged, allowMissingColumns=True)
@@ -146,6 +180,7 @@ def transform_silver(bronze_df: DataFrame) -> DataFrame:
         "open", "high", "low", "close",
         "volume", "quote_volume", "trade_count",
         "taker_buy_base_vol", "partition_date", "ingest_time",
+        "_is_new",  # set by _load_history; needed to drop history rows after indicators
     ]
     if "close_time" in bronze_df.columns:
         cols.insert(2, "close_time")
@@ -243,6 +278,25 @@ def transform_silver(bronze_df: DataFrame) -> DataFrame:
         ).otherwise(None)
     )
 
+    # Warm-up: an indicator stays null until its window holds enough values
+    def _require(column: str, counted: str, minimum: int):
+        seen = F.count(counted).over(sym_win.rowsBetween(-(minimum - 1), 0))
+        return F.when(seen >= minimum, F.col(column))
+
+    # Order matters: macd_signal / macd_hist are gated before macd itself is nulled
+    warmup = [
+        ("ma7", "close", 7), ("ma25", "close", 25), ("ma99", "close", 99),
+        ("bb_middle", "close", 20), ("bb_upper", "close", 20), ("bb_lower", "close", 20),
+        ("atr_14", "close", 14),
+        ("rsi_14", "prev_close", 14),       # 14 price changes = 15 candles
+        ("macd_signal", "close", 34),       # 26 candles for MACD + 8 more for SMA9
+        ("macd_hist", "close", 34),
+        ("macd", "close", 26),
+        ("avg_volume_20", "volume", 20), ("volume_ratio", "volume", 20),
+    ]
+    for column, counted, minimum in warmup:
+        df = df.withColumn(column, _require(column, counted, minimum))
+
     # Candle pattern
     df = df.withColumn(
         "candle_pattern",
@@ -258,33 +312,34 @@ def transform_silver(bronze_df: DataFrame) -> DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _load_gold_history(spark: SparkSession, new_df: DataFrame):
-    """Load recent historical data from Delta Gold and union with new batch."""
+    """Load Gold context for window functions and union it with the new rows.
+
+    For each (symbol, timeframe): the GOLD_HISTORY_ROWS windows preceding the
+    first new window, plus stored windows between the first and last new one.
+    Windows newer than the new rows are never used.
+    """
     path = delta_path("gold", "ohlcv")
     try:
         hist_df = spark.read.format("delta").load(path)
     except Exception:
         return new_df.withColumn("_is_new", F.lit(True)), False
 
-    pairs = new_df.select("symbol", "timeframe").distinct().collect()
-    if not pairs:
-        return new_df.withColumn("_is_new", F.lit(True)), False
+    series = ["symbol", "timeframe"]
+    bounds = new_df.groupBy(*series).agg(
+        F.min("window_start").alias("_first"), F.max("window_start").alias("_last")
+    )
+    candidates = (
+        hist_df.join(F.broadcast(bounds), series)
+        .filter(F.col("window_start") <= F.col("_last"))
+        .withColumn("_before", F.col("window_start") < F.col("_first"))
+    )
+    newest_first = Window.partitionBy(*series, "_before").orderBy(F.col("window_start").desc())
+    history = (
+        candidates.withColumn("_rn", F.row_number().over(newest_first))
+        .filter(~F.col("_before") | (F.col("_rn") <= GOLD_HISTORY_ROWS))
+        .drop("_first", "_last", "_before", "_rn")
+    )
 
-    from functools import reduce as _reduce
-    frames = []
-    for row in pairs:
-        sym, tf = row["symbol"], row["timeframe"]
-        subset = (
-            hist_df
-            .filter((F.col("symbol") == sym) & (F.col("timeframe") == tf))
-            .orderBy(F.col("window_start").desc())
-            .limit(20)
-        )
-        frames.append(subset)
-
-    if not frames:
-        return new_df.withColumn("_is_new", F.lit(True)), False
-
-    history = _reduce(DataFrame.unionByName, frames)
     # Strip metadata columns added by transform_gold() on prior writes
     # to avoid duplicates when they are re-joined later.
     for drop_col in ("name", "base_asset", "consensus", "cmc_rank", "aggregated_at", "partition_date"):
@@ -305,34 +360,87 @@ def _seconds_to_duration(seconds: int) -> str:
     return f"{seconds} seconds"
 
 
-def transform_gold(silver_df: DataFrame, spark: SparkSession) -> DataFrame:
-    """Resample to multi-timeframe + VWAP + window functions + metadata join."""
+def _candles_for_windows(spark: SparkSession, new_df: DataFrame):
+    """All 1m candles from Silver needed to rebuild every window touched by new_df.
+
+    Every timeframe (5m..1d) nests inside a UTC day, so loading the full days of
+    the new candles is enough. Returns None when there is nothing to aggregate.
+    """
+    days = (
+        new_df.groupBy("symbol")
+        .agg(
+            F.date_trunc("day", F.min("open_time")).alias("_from"),
+            (F.date_trunc("day", F.max("open_time")) + F.expr("INTERVAL 1 DAY")).alias("_to"),
+        )
+        .collect()
+    )
+    if not days:
+        return None
+
     from functools import reduce
+    in_scope = reduce(
+        lambda a, b: a | b,
+        [
+            (F.col("symbol") == d["symbol"])
+            & (F.col("partition_date") >= F.to_date(F.lit(d["_from"])))
+            & (F.col("open_time") >= F.lit(d["_from"]))
+            & (F.col("open_time") < F.lit(d["_to"]))
+            for d in days
+        ],
+    )
+    silver = spark.read.format("delta").load(delta_path("silver", "ohlcv")).filter(in_scope)
+    # Tables written before the Silver MERGE may still hold duplicate candles
+    latest_first = Window.partitionBy(*CANDLE_KEY).orderBy(F.col("ingest_time").desc_nulls_last())
+    return (
+        silver.withColumn("_rn", F.row_number().over(latest_first))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+    )
+
+
+def transform_gold(silver_df: DataFrame, spark: SparkSession) -> DataFrame:
+    """Resample to multi-timeframe + VWAP + window functions + metadata join.
+
+    silver_df only tells which windows changed; their values are rebuilt from
+    every candle stored in Silver, so Silver must be written first.
+    """
+    from functools import reduce
+
+    candles = _candles_for_windows(spark, silver_df)
+    if candles is None:
+        return None
+
+    def _last_known(column: str):
+        """Value of the latest candle (by open_time) where column is not null."""
+        return F.max_by(column, F.when(F.col(column).isNotNull(), F.col("open_time"))).alias(column)
 
     all_frames = []
     for name, secs in RESAMPLE_INTERVALS.items():
         dur = _seconds_to_duration(secs)
+        window = F.window(F.col("open_time"), dur).alias("time_window")
+        touched = silver_df.groupBy("symbol", window).count().select("symbol", "time_window")
         agg = (
-            silver_df
-            .groupBy("symbol", F.window(F.col("open_time"), dur).alias("time_window"))
+            candles
+            .groupBy("symbol", window)
             .agg(
-                F.first("open", ignorenulls=True).alias("open"),
+                F.min_by("open", "open_time").alias("open"),
                 F.max("high").alias("high"),
                 F.min("low").alias("low"),
-                F.last("close", ignorenulls=True).alias("close"),
+                F.max_by("close", "open_time").alias("close"),
                 F.sum("volume").alias("volume"),
                 F.sum("quote_volume").alias("quote_volume"),
                 F.sum("trade_count").alias("trade_count"),
-                F.last("ma7", ignorenulls=True).alias("ma7"),
-                F.last("ma25", ignorenulls=True).alias("ma25"),
-                F.last("rsi_14", ignorenulls=True).alias("rsi_14"),
-                F.last("macd", ignorenulls=True).alias("macd"),
-                F.last("macd_signal", ignorenulls=True).alias("macd_signal"),
-                F.last("bb_upper", ignorenulls=True).alias("bb_upper"),
-                F.last("bb_lower", ignorenulls=True).alias("bb_lower"),
-                F.last("atr_14", ignorenulls=True).alias("atr_14"),
-                F.last("candle_pattern", ignorenulls=True).alias("candle_pattern"),
+                _last_known("ma7"),
+                _last_known("ma25"),
+                _last_known("rsi_14"),
+                _last_known("macd"),
+                _last_known("macd_signal"),
+                _last_known("bb_upper"),
+                _last_known("bb_lower"),
+                _last_known("atr_14"),
+                _last_known("candle_pattern"),
             )
+            .join(touched, ["symbol", "time_window"], "left_semi")
             .select(
                 "symbol",
                 F.lit(name).alias("timeframe"),
@@ -565,6 +673,89 @@ def evaluate_alerts(gold_df: DataFrame, spark: SparkSession) -> DataFrame:
 # UNIFIED foreachBatch PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _upsert_silver(spark: SparkSession, silver_df: DataFrame, path: str) -> None:
+    """MERGE Silver by candle key so a re-sent or replayed candle never duplicates."""
+    from delta.tables import DeltaTable
+
+    if not DeltaTable.isDeltaTable(spark, path):
+        silver_df.write.format("delta").mode("append") \
+            .partitionBy("symbol", "partition_date") \
+            .save(path)
+        return
+
+    (
+        DeltaTable.forPath(spark, path).alias("tgt")
+        .merge(
+            silver_df.alias("src"),
+            "tgt.symbol = src.symbol AND tgt.partition_date = src.partition_date "
+            "AND tgt.`interval` = src.`interval` AND tgt.open_time = src.open_time",
+        )
+        .whenMatchedUpdateAll(condition="src.ingest_time >= tgt.ingest_time")
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+
+def _upsert_gold(spark: SparkSession, gold_df: DataFrame, path: str) -> None:
+    """MERGE Gold by window key. Rows hold the whole window, so replace every column."""
+    from delta.tables import DeltaTable
+
+    if not DeltaTable.isDeltaTable(spark, path):
+        gold_df.write.format("delta").mode("append") \
+            .partitionBy("symbol", "timeframe", "partition_date") \
+            .save(path)
+        return
+
+    (
+        DeltaTable.forPath(spark, path).alias("tgt")
+        .merge(
+            gold_df.alias("src"),
+            "tgt.symbol = src.symbol AND tgt.timeframe = src.timeframe "
+            "AND tgt.partition_date = src.partition_date AND tgt.window_start = src.window_start",
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+
+def _write_gold_mongo(gold_df: DataFrame) -> None:
+    """Upsert Gold into MongoDB, matching documents on the window key (not _id)."""
+    (
+        gold_df.write.format("mongodb")
+        .mode("append")
+        .option("spark.mongodb.write.connection.uri", MONGO_URI)
+        .option("spark.mongodb.write.database", MONGO_DB)
+        .option("spark.mongodb.write.collection", "gold_ohlcv")
+        .option("spark.mongodb.write.operationType", "replace")
+        .option("spark.mongodb.write.idFieldList", ",".join(GOLD_KEY))
+        .option("spark.mongodb.write.upsertDocument", "true")
+        .save()
+    )
+
+
+def _ensure_gold_index() -> None:
+    """Index the Gold key: upserts need it, and uniqueness blocks new duplicates.
+
+    Existing duplicates are never deleted here; a non-unique index is used instead.
+    """
+    try:
+        from pymongo import ASCENDING, MongoClient
+        from pymongo.errors import OperationFailure
+
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        collection = client[MONGO_DB]["gold_ohlcv"]
+        keys = [(k, ASCENDING) for k in GOLD_KEY]
+        try:
+            collection.create_index(keys, unique=True)
+        except OperationFailure as exc:
+            logger.warning("gold_ohlcv: unique index not created: %s", str(exc)[:200])
+            collection.create_index(keys, name="gold_key_non_unique")
+        client.close()
+    except Exception as exc:
+        logger.warning("Could not create gold_ohlcv index: %s", exc)
+
+
 def process_batch(batch_df: DataFrame, batch_id: int):
     """Called for each micro-batch — runs full Medallion pipeline."""
     try:
@@ -593,67 +784,19 @@ def process_batch(batch_df: DataFrame, batch_id: int):
             silver_df = silver_full.drop("_is_new") if "_is_new" in silver_full.columns else silver_full
         
         silver_df.cache()
-        silver_df.write.format("delta").mode("append") \
-            .option("mergeSchema", "true") \
-            .partitionBy("symbol", "partition_date") \
-            .save(delta_path("silver", "ohlcv"))
+        _upsert_silver(spark, silver_df, delta_path("silver", "ohlcv"))
         logger.info("Batch %d: Silver written.", batch_id)
 
-        # ── Gold (Fix #2: MERGE upsert instead of append) ────────────────
+        # ── Gold: rebuild touched windows from Silver, then upsert ───────
         gold_df = transform_gold(silver_df, spark)
         if gold_df is not None and not gold_df.isEmpty():
             gold_df.cache()
-            gold_path = delta_path("gold", "ohlcv")
-            # Use Delta MERGE to upsert — avoids duplicates for in-progress windows
-            try:
-                from delta.tables import DeltaTable
-                gold_table = DeltaTable.forPath(spark, gold_path)
-                gold_table.alias("tgt").merge(
-                    gold_df.alias("src"),
-                    """tgt.symbol = src.symbol
-                       AND tgt.timeframe = src.timeframe
-                       AND tgt.window_start = src.window_start"""
-                ).whenMatchedUpdate(set={
-                    "high":           "src.high",
-                    "low":            "src.low",
-                    "close":          "src.close",
-                    "volume":         "src.volume",
-                    "quote_volume":   "src.quote_volume",
-                    "trade_count":    "src.trade_count",
-                    "ma7":            "src.ma7",
-                    "ma25":           "src.ma25",
-                    "rsi_14":         "src.rsi_14",
-                    "macd":           "src.macd",
-                    "macd_signal":    "src.macd_signal",
-                    "bb_upper":       "src.bb_upper",
-                    "bb_lower":       "src.bb_lower",
-                    "atr_14":         "src.atr_14",
-                    "candle_pattern": "src.candle_pattern",
-                    "vwap":           "src.vwap",
-                    "volume_ratio":   "src.volume_ratio",
-                    "aggregated_at":  "src.aggregated_at",
-                }).whenNotMatchedInsertAll().execute()
-            except Exception:
-                # First run — table doesn't exist yet, fall back to write
-                gold_df.write.format("delta").mode("append") \
-                    .option("mergeSchema", "true") \
-                    .partitionBy("symbol", "timeframe", "partition_date") \
-                    .save(gold_path)
+            _upsert_gold(spark, gold_df, delta_path("gold", "ohlcv"))
             logger.info("Batch %d: Gold written to Delta.", batch_id)
 
             # ── Sync Gold to MongoDB (upsert to avoid duplicates) ─────────
             try:
-                (
-                    gold_df.write.format("mongodb")
-                    .mode("append")
-                    .option("spark.mongodb.write.connection.uri", MONGO_URI)
-                    .option("spark.mongodb.write.database", MONGO_DB)
-                    .option("spark.mongodb.write.collection", "gold_ohlcv")
-                    .option("spark.mongodb.write.operationType", "replace")
-                    .option("spark.mongodb.write.replaceDocument.shardKey",
-                            '{"symbol": 1, "timeframe": 1, "window_start": 1}')
-                    .save()
-                )
+                _write_gold_mongo(gold_df)
                 logger.info("Batch %d: Gold written to MongoDB.", batch_id)
             except Exception as mongo_exc:
                 logger.warning("Batch %d: Failed to sync Gold to MongoDB: %s", batch_id, mongo_exc)
@@ -791,6 +934,8 @@ def main():
         "PIPELINE_START_TIME = %s — alerts will only fire for data after this timestamp.",
         PIPELINE_START_TIME.strftime("%Y-%m-%d %H:%M:%S UTC"),
     )
+
+    _ensure_gold_index()
 
     # Run the streaming query in a restart loop so transient errors don't stop the container
     while True:
