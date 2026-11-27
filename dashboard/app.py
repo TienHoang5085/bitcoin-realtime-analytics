@@ -172,13 +172,34 @@ def load_alert_events(limit: int = 50):
         return events
     except: return []
 
+def as_number(value):
+    """Indicator value as float, or None when missing.
+
+    Indicators stay empty until a timeframe has enough candles. pandas gives
+    None when the whole column is empty and NaN when only some rows are.
+    """
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(number) else number
+
+def fmt(value, spec, suffix=""):
+    """Format an indicator, or show a dash when it is not available yet."""
+    number = as_number(value)
+    return "—" if number is None else f"{number:{spec}}{suffix}"
+
 def get_rsi_advice(rsi):
+    rsi = as_number(rsi)
     if rsi is None: return "NEUTRAL", "advice-neutral", "Waiting for data..."
     if rsi > 70: return "SELL / OVERBOUGHT", "advice-sell", "Price is likely stretched high."
     if rsi < 30: return "BUY / OVERSOLD", "advice-buy", "Price might be undervalued."
     return "NEUTRAL", "advice-neutral", "Market is in balance."
 
 def get_macd_advice(macd, signal):
+    macd, signal = as_number(macd), as_number(signal)
     if macd is None or signal is None: return "NEUTRAL", "advice-neutral"
     if macd > signal: return "BULLISH MOMENTUM", "advice-buy"
     return "BEARISH MOMENTUM", "advice-sell"
@@ -266,14 +287,19 @@ if page == "Dashboard":
             st.markdown(f'<div class="premium-card"><div class="metric-label">Live Price</div><div class="metric-value">${latest["close"]:.2f}</div><div style="color: {"#3fb950" if change >= 0 else "#f85149"}; font-weight: 600;">{"▲" if change >= 0 else "▼"} {abs(change):.2f}%</div></div>', unsafe_allow_html=True)
         with m2:
             rsi_text, rsi_class, rsi_desc = get_rsi_advice(latest.get('rsi_14'))
-            st.markdown(f'<div class="premium-card"><div class="metric-label">RSI (14) Status</div><div class="metric-value">{latest.get("rsi_14", 0):.1f}</div><div class="metric-advice {rsi_class}">{rsi_text}</div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="premium-card"><div class="metric-label">RSI (14) Status</div><div class="metric-value">{fmt(latest.get("rsi_14"), ".1f")}</div><div class="metric-advice {rsi_class}">{rsi_text}</div></div>', unsafe_allow_html=True)
         with m3:
             macd_text, macd_class = get_macd_advice(latest.get('macd'), latest.get('macd_signal'))
-            st.markdown(f'<div class="premium-card"><div class="metric-label">MACD Signal</div><div class="metric-value">{latest.get("macd", 0):.4f}</div><div class="metric-advice {macd_class}">{macd_text}</div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="premium-card"><div class="metric-label">MACD Signal</div><div class="metric-value">{fmt(latest.get("macd"), ".4f")}</div><div class="metric-advice {macd_class}">{macd_text}</div></div>', unsafe_allow_html=True)
         with m4:
-            vol_ratio = latest.get('volume_ratio', 0)
-            vol_class = "advice-buy" if vol_ratio > 1.5 else "advice-neutral"
-            st.markdown(f'<div class="premium-card"><div class="metric-label">Vol Ratio</div><div class="metric-value">{vol_ratio:.2f}x</div><div class="metric-advice {vol_class}">{"HIGH SURGE" if vol_ratio > 1.5 else "NORMAL"}</div></div>', unsafe_allow_html=True)
+            vol_ratio = as_number(latest.get('volume_ratio'))
+            if vol_ratio is None:
+                vol_class, vol_text = "advice-neutral", "WAITING FOR DATA"
+            elif vol_ratio > 1.5:
+                vol_class, vol_text = "advice-buy", "HIGH SURGE"
+            else:
+                vol_class, vol_text = "advice-neutral", "NORMAL"
+            st.markdown(f'<div class="premium-card"><div class="metric-label">Vol Ratio</div><div class="metric-value">{fmt(vol_ratio, ".2f", "x")}</div><div class="metric-advice {vol_class}">{vol_text}</div></div>', unsafe_allow_html=True)
 
         c_main, c_side = st.columns([3, 1])
         with c_main:
@@ -283,7 +309,10 @@ if page == "Dashboard":
             with t2: st.plotly_chart(create_oscillator_chart(df, 'macd', '#58a6ff', hlines=[0]), use_container_width=True)
         with c_side:
             st.markdown("### 💡 Trading Advice")
-            st.markdown(f'<div class="premium-card" style="padding: 15px;"><p style="font-size: 14px; color: var(--text-muted);">Signals for <b>{selected_symbol}</b>:</p><hr style="opacity: 0.1"><p><b>RSI:</b> {rsi_desc}</p><p><b>Momentum:</b> {"Positive" if latest.get("macd", 0) > 0 else "Negative"}</p><p><b>Trend:</b> {"Bullish" if latest["close"] > latest.get("ma25", 0) else "Bearish"}</p></div>', unsafe_allow_html=True)
+            macd_now, ma25_now = as_number(latest.get("macd")), as_number(latest.get("ma25"))
+            momentum = "Waiting for data..." if macd_now is None else ("Positive" if macd_now > 0 else "Negative")
+            trend = "Waiting for data..." if ma25_now is None else ("Bullish" if latest["close"] > ma25_now else "Bearish")
+            st.markdown(f'<div class="premium-card" style="padding: 15px;"><p style="font-size: 14px; color: var(--text-muted);">Signals for <b>{selected_symbol}</b>:</p><hr style="opacity: 0.1"><p><b>RSI:</b> {rsi_desc}</p><p><b>Momentum:</b> {momentum}</p><p><b>Trend:</b> {trend}</p></div>', unsafe_allow_html=True)
             st.caption(f"Last updated: {latest['window_start'].strftime('%H:%M:%S')}")
     else:
         st.warning("📡 Connecting to data stream... (GMT+7)")
