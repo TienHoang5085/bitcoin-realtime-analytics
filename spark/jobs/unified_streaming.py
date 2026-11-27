@@ -77,6 +77,11 @@ ALERT_RULE_SCHEMA = (
 # trigger notifications.
 PIPELINE_START_TIME: datetime | None = None
 
+# ── Retry after a failed batch ────────────────────────────────────────────
+MAX_CONSECUTIVE_FAILURES = 10
+RETRY_DELAY_SECONDS = 30
+_consecutive_failures = 0
+
 
 def _latest_closed_candles(df: DataFrame) -> DataFrame:
     """Keep closed candles only, one row per candle (latest ingest_time wins)."""
@@ -102,11 +107,14 @@ def _load_history(spark: SparkSession, new_df: DataFrame) -> DataFrame:
     """
     new_df = _latest_closed_candles(new_df)
 
+    from delta.tables import DeltaTable
+
     path = delta_path("bronze", "ohlcv")
-    try:
-        hist_df = spark.read.format("delta").load(path)
-    except Exception:
+    # Only a missing table means "no history". A read error must fail the batch,
+    # otherwise indicators would be computed without context and stored.
+    if not DeltaTable.isDeltaTable(spark, path):
         return new_df.withColumn("_is_new", F.lit(True)), False
+    hist_df = spark.read.format("delta").load(path)
 
     bounds = (
         new_df.groupBy("symbol", "interval")
@@ -355,11 +363,14 @@ def _load_gold_history(spark: SparkSession, new_df: DataFrame):
     first new window, plus stored windows between the first and last new one.
     Windows newer than the new rows are never used.
     """
+    from delta.tables import DeltaTable
+
     path = delta_path("gold", "ohlcv")
-    try:
-        hist_df = spark.read.format("delta").load(path)
-    except Exception:
+    # Only a missing table means "no history". A read error must fail the batch,
+    # otherwise the MERGE could overwrite good indicators with nulls.
+    if not DeltaTable.isDeltaTable(spark, path):
         return new_df.withColumn("_is_new", F.lit(True)), False
+    hist_df = spark.read.format("delta").load(path)
 
     series = ["symbol", "timeframe"]
     bounds = new_df.groupBy(*series).agg(
@@ -815,7 +826,14 @@ def _append_bronze(spark: SparkSession, bronze_df: DataFrame, batch_id: int) -> 
 
 
 def process_batch(batch_df: DataFrame, batch_id: int):
-    """Called for each micro-batch — runs full Medallion pipeline."""
+    """Called for each micro-batch — runs full Medallion pipeline.
+
+    A failure in Bronze, Silver, Gold or the Gold MongoDB sync is re-raised so
+    Spark does not commit the batch and it is replayed; every one of those writes
+    is idempotent. Alert errors are only logged, because replaying a batch could
+    publish the same alerts twice.
+    """
+    global _consecutive_failures
     try:
         if batch_df.isEmpty():
             return
@@ -850,11 +868,8 @@ def process_batch(batch_df: DataFrame, batch_id: int):
             logger.info("Batch %d: Gold written to Delta.", batch_id)
 
             # ── Sync Gold to MongoDB (upsert to avoid duplicates) ─────────
-            try:
-                _write_gold_mongo(gold_df)
-                logger.info("Batch %d: Gold written to MongoDB.", batch_id)
-            except Exception as mongo_exc:
-                logger.warning("Batch %d: Failed to sync Gold to MongoDB: %s", batch_id, mongo_exc)
+            _write_gold_mongo(gold_df)
+            logger.info("Batch %d: Gold written to MongoDB.", batch_id)
 
             # ── Alert Evaluation (only for REAL-TIME data) ────────────────────
             # Backfill data (window_start < PIPELINE_START_TIME) is processed
@@ -952,10 +967,12 @@ def process_batch(batch_df: DataFrame, batch_id: int):
             except Exception as exc:
                 logger.warning("Alert evaluation skipped: %s", exc)
 
+        _consecutive_failures = 0
         logger.info("Batch %d complete.", batch_id)
 
-    except Exception as exc:  # Catch any error in a micro-batch to avoid stopping the stream
-        logger.exception("Processing of batch %d failed and will be skipped: %s", batch_id, exc)
+    except Exception as exc:
+        logger.exception("Processing of batch %d failed and will be retried: %s", batch_id, exc)
+        raise
     finally:
         if 'bronze_df' in locals() and bronze_df is not None:
             try: bronze_df.unpersist()
@@ -972,7 +989,7 @@ def process_batch(batch_df: DataFrame, batch_id: int):
 # Main
 # ─────────────────────────────────────────────
 def main():
-    global PIPELINE_START_TIME
+    global PIPELINE_START_TIME, _consecutive_failures
     PIPELINE_START_TIME = datetime.now(timezone.utc)
 
     spark = create_spark_session(
@@ -993,7 +1010,8 @@ def main():
 
     _ensure_gold_index()
 
-    # Run the streaming query in a restart loop so transient errors don't stop the container
+    # Restart the query after an error: the checkpoint has not committed the failed
+    # batch, so the new query replays it. Give up after too many failures in a row.
     while True:
         try:
             stream = (
@@ -1029,11 +1047,16 @@ def main():
                 pass
             break
         except Exception as exc:
-            logger.exception("Streaming query failed with error: %s", exc)
-            # Nếu gặp lỗi nghiêm trọng (như SparkContext sập), thoát luôn
-            # để Kubernetes tự động khởi tạo lại một Pod mới sạch sẽ.
-            import sys
-            sys.exit(1)
+            _consecutive_failures += 1
+            logger.exception(
+                "Streaming query failed (%d/%d): %s",
+                _consecutive_failures, MAX_CONSECUTIVE_FAILURES, exc,
+            )
+            # Lỗi lặp lại liên tục (ví dụ SparkContext sập): thoát để
+            # Kubernetes tự động khởi tạo lại một Pod mới sạch sẽ.
+            if _consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                sys.exit(1)
+            time.sleep(RETRY_DELAY_SECONDS)
 
 
 if __name__ == "__main__":
