@@ -10,6 +10,7 @@ Chạy:
     spark-submit spark/jobs/unified_streaming.py
 """
 
+import gc
 import json
 import logging
 import os
@@ -825,6 +826,17 @@ def _append_bronze(spark: SparkSession, bronze_df: DataFrame, batch_id: int) -> 
     writer.save(delta_path("bronze", "ohlcv"))
 
 
+def _materialize(df: DataFrame) -> DataFrame:
+    """Compute df now and keep the result, cutting its lineage.
+
+    cache() is lazy and isEmpty() fills it only partly, so every later action
+    (MERGE, MongoDB write, alerts) recomputed the whole Silver/Gold plan,
+    including the history reads. Timestamps such as aggregated_at are also
+    fixed once, so Delta and MongoDB get the same values.
+    """
+    return df.localCheckpoint(eager=True)
+
+
 def process_batch(batch_df: DataFrame, batch_id: int):
     """Called for each micro-batch — runs full Medallion pipeline.
 
@@ -855,15 +867,18 @@ def process_batch(batch_df: DataFrame, batch_id: int):
             silver_df = silver_full.filter(F.col("_is_new") == True).drop("_is_new")  # noqa: E712
         else:
             silver_df = silver_full.drop("_is_new") if "_is_new" in silver_full.columns else silver_full
-        
-        silver_df.cache()
+
+        # Compute once: the MERGE, transform_gold and its window lookups all reuse it
+        silver_df = _materialize(silver_df)
         _upsert_silver(spark, silver_df, delta_path("silver", "ohlcv"))
         logger.info("Batch %d: Silver written.", batch_id)
 
         # ── Gold: rebuild touched windows from Silver, then upsert ───────
         gold_df = transform_gold(silver_df, spark)
+        if gold_df is not None:
+            # Compute once for the Delta MERGE, MongoDB and alerts
+            gold_df = _materialize(gold_df)
         if gold_df is not None and not gold_df.isEmpty():
-            gold_df.cache()
             _upsert_gold(spark, gold_df, delta_path("gold", "ohlcv"))
             logger.info("Batch %d: Gold written to Delta.", batch_id)
 
@@ -983,6 +998,10 @@ def process_batch(batch_df: DataFrame, batch_id: int):
         if 'gold_df' in locals() and gold_df is not None:
             try: gold_df.unpersist()
             except Exception: pass
+        # Python DataFrames caught in reference cycles keep their JVM plans alive
+        # until a full Python GC, which rarely runs on its own; collect every batch
+        # so the driver heap is freed steadily.
+        gc.collect()
 
 
 # ─────────────────────────────────────────────

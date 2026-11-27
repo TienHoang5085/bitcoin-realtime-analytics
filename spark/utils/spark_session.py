@@ -91,6 +91,14 @@ def create_spark_session(
     conf.set("spark.memory.fraction",              "0.8")
     conf.set("spark.memory.storageFraction",       "0.3")
 
+    # ── Spark UI history (driver heap) ────────────────────────────────────
+    # Each micro-batch runs ~150 jobs; keeping the default 1000 jobs/stages and
+    # 1000 SQL executions filled the 512m driver heap and slowed batches by GC.
+    conf.set("spark.ui.retainedJobs",              "100")
+    conf.set("spark.ui.retainedStages",            "100")
+    conf.set("spark.ui.retainedTasks",             "10000")
+    conf.set("spark.sql.ui.retainedExecutions",    "50")
+
     # ── Broadcast join threshold ──────────────────────────────────────────
     conf.set("spark.sql.autoBroadcastJoinThreshold", str(10 * 1024 * 1024))   # 10 MB
 
