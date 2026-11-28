@@ -116,7 +116,7 @@ Log và kết quả được lưu trong `tests/fault_tolerance/out/`. Thư mục
 ```bash
 # Laptop 1
 tests/fault_tolerance/ft.sh stop
-docker compose -f docker-compose.yml -f docker-compose.2node.yml stop kafka-lan spark-worker spark-master
+docker stop crypto-kafka-lan crypto-spark-worker crypto-spark-master
 # Laptop 2
 NODE1_IP=x docker compose -f docker-compose.worker2.yml down
 ```
@@ -138,6 +138,30 @@ Chưa thử được trên một máy:
 - Tắt Wi-Fi (K3).
 
 Ba việc này phải làm trên hai máy thật.
+
+## Kết quả buổi thử trên 2 máy (2026-11-28, giờ UTC)
+
+- Laptop 1 ở `192.168.1.252` (SSID "P306 5G"), Laptop 2 ở `192.168.1.227` (SSID "P306 5G 2"), cùng một router.
+- Mỗi worker có 2 core và 2 GB. Mỗi phút đưa vào 300 message, tổng cộng 45 đợt, 13.500 message.
+- Đồng hồ Laptop 1 nhanh 13,6 giây so với `time.windows.com`. Các mốc dưới đây đã quy về giờ thật.
+
+| # | Sự cố | Phát hiện | Phục hồi |
+|---|---|---|---|
+| K1 | Không có, 10 batch | — | Task chia ra cả hai máy (Laptop 1: 68%, Laptop 2: 32%); batch 34–44 giây (batch đầu 68 giây); không lỗi |
+| K2 | `docker kill` Worker 2 giữa batch, 61 giây sau bật lại | Khoảng 2 giây (kết nối bị đóng) | Batch dở xong bình thường trên Laptop 1 (33 giây). Worker 2 bật lại thì có executor mới sau khoảng 3 giây |
+| K3 | Tắt Wi-Fi Laptop 2 giữa batch, 2 phút 46 giây | Driver: 38 giây. Master: 76 giây (hết 60 giây chờ heartbeat) | Hai task dở được chạy lại trên Laptop 1; batch đó mất 81 giây. Ba batch sau chạy chỉ với Laptop 1. Có mạng lại thì 29 giây sau Worker 2 tự đăng ký lại |
+| K4 | `docker kill` Worker 1 giữa batch, 60 giây sau bật lại | Ngay lập tức | Spark tính lại phần shuffle đã mất; batch dở chạy tiếp chỉ trên Laptop 2 và xong sau 107 giây. Worker 1 có executor mới 2 giây sau khi bật |
+| K5 | `docker kill` Master giữa batch, 60 giây sau bật lại | Ngay lập tức | **Không tự phục hồi.** Batch đang chạy vẫn xong khi không có Master. Nhưng Master mới không có trạng thái, nên ra lệnh cho worker kill executor của ứng dụng cũ. Batch tiếp theo treo hơn 3 phút |
+| K6 | Kill rồi bật lại driver, ngay sau K5 | — | Ứng dụng mới nhận executor trên cả hai máy sau 4 giây; batch đang treo được chạy lại từ checkpoint và xong sau 95 giây |
+
+**Đối chiếu sau cả 6 kịch bản:**
+- Bronze: 13.500/13.500 message thử, 0 cặp partition/offset trùng.
+- Silver: 19.266 nến, khớp 100%.
+- Gold: 5.605 khung, khớp 100%.
+- MongoDB: 5.605 document, khớp 100%.
+- Dữ liệu thật không đổi.
+
+**Bài học từ K5:** Master Standalone không bật recovery mode là điểm lỗi duy nhất. Muốn Master khởi động lại mà không giết ứng dụng thì cần `spark.deploy.recoveryMode=FILESYSTEM` (vẫn một Master, nhưng lưu trạng thái ra đĩa) hoặc ZooKeeper (nhiều Master). Hai cách này chưa được thử.
 
 ## Hạn chế
 - Laptop 1 vẫn là điểm lỗi duy nhất: Kafka (1 broker), MinIO, MongoDB, Master và driver đều ở đó.
