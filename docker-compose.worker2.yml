@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────
+# Laptop 2 in the two-laptop fault-tolerance test (see tests/fault_tolerance/README.md)
+#
+#   NODE1_IP=<Laptop 1 IP> docker compose -f docker-compose.worker2.yml up -d
+#
+# One extra Spark worker that joins the master on Laptop 1. Every name the
+# pipeline uses (master, driver, Kafka, MinIO, MongoDB, the other worker)
+# resolves to Laptop 1, where those ports are published.
+# ─────────────────────────────────────────────
+
+services:
+  spark-worker-2:
+    image: crypto-analytics/spark:latest
+    container_name: crypto-spark-worker-2
+    hostname: spark-worker-2
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --host
+      - spark-worker-2
+      - --port
+      - "7100"
+      - --webui-port
+      - "8081"
+    ports:
+      - "7100:7100"   # worker RPC (the master launches executors through it)
+      - "7090:7090"   # executor block manager (shuffle blocks)
+      - "8081:8081"   # worker web UI
+    environment:
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_DIR: /tmp/spark-work
+      SPARK_LOCAL_DIRS: /tmp/spark-local
+      PYTHONPATH: /opt/spark/work-dir/spark:/opt/spark/work-dir
+    volumes:
+      # Executors import the UDF modules from the repo
+      - ./spark:/opt/spark/work-dir/spark:ro
+    extra_hosts:
+      - "spark-master:${NODE1_IP:?set NODE1_IP to the IP of Laptop 1}"
+      - "spark-driver:${NODE1_IP}"
+      - "spark-worker:${NODE1_IP}"
+      - "kafka:${NODE1_IP}"
+      - "minio:${NODE1_IP}"
+      - "mongodb:${NODE1_IP}"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'

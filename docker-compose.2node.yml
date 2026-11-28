@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────
+# Laptop 1 in the two-laptop fault-tolerance test (see tests/fault_tolerance/README.md)
+#
+#   docker compose up -d --no-recreate kafka minio mongodb
+#   NODE2_IP=<Laptop 2 IP> docker compose -f docker-compose.yml -f docker-compose.2node.yml \
+#       up -d kafka-lan spark-master spark-worker
+#
+# Every service keeps its usual name. Laptop 2 maps those names to the IP of Laptop 1
+# (extra_hosts in docker-compose.worker2.yml), and Laptop 1 maps spark-worker-2 to
+# the IP of Laptop 2, so the pipeline code and its settings stay unchanged.
+# ─────────────────────────────────────────────
+
+services:
+  # Laptop 2 executors read Kafka through the internal listener kafka:29092.
+  # A relay publishes that port, so the kafka container itself is not recreated:
+  # it has no volume, and recreating it would drop every retained message.
+  kafka-lan:
+    image: alpine/socat:latest
+    container_name: crypto-kafka-lan
+    command: [ "TCP-LISTEN:29092,fork,reuseaddr", "TCP:kafka:29092" ]
+    ports:
+      - "29092:29092"
+    networks:
+      - crypto-net
+
+  spark-master:
+    extra_hosts:
+      - "spark-worker-2:${NODE2_IP:?set NODE2_IP to the IP of Laptop 2}"
+
+  spark-worker:
+    # A fixed host name: its executors advertise it, and Laptop 2 resolves it
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --host
+      - spark-worker
+    ports:
+      # Executor block manager (shuffle blocks); spark.blockManager.port=7090
+      - "7090:7090"
+    extra_hosts:
+      - "spark-worker-2:${NODE2_IP:?set NODE2_IP to the IP of Laptop 2}"
